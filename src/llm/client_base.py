@@ -1,4 +1,5 @@
 from threading import Lock
+from contextlib import contextmanager
 from typing import AsyncGenerator, Any
 from enum import Enum
 from openai import APIConnectionError, BadRequestError, OpenAI, AsyncOpenAI, RateLimitError
@@ -19,6 +20,18 @@ from src.actions.function_manager import FunctionManager
 from src.llm.claude_cache_connector import ClaudeCacheConnector
 
 logger = utils.get_logger()
+
+GENERATION_LOCK_TIMEOUT_SECONDS = 300
+
+@contextmanager
+def _timed_lock(lock: Lock, timeout_seconds: int):
+    """Acquires the lock with a timeout so a stuck holder cannot deadlock the client forever"""
+    if not lock.acquire(timeout=timeout_seconds):
+        raise TimeoutError(f"Could not acquire generation lock within {timeout_seconds} seconds. Another LLM call may be stuck.")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class VisionMode(Enum):
@@ -176,7 +189,7 @@ class ClientBase(AIClient):
         Returns:
             The full chat completion object or None if the request failed
         """
-        with self._generation_lock:
+        with _timed_lock(self._generation_lock, GENERATION_LOCK_TIMEOUT_SECONDS):
             sync_client = self.generate_sync_client()        
             chat_completion: ChatCompletion = None
             logger.log(28, 'Getting LLM response...')
@@ -241,7 +254,7 @@ class ClientBase(AIClient):
     @utils.time_it
     async def streaming_call(self, messages: Message | message_thread, is_multi_npc: bool, tools: list[dict] = None) -> AsyncGenerator[tuple[str, str | list] | None, None]:
         with create_span_from_thread("llm_streaming_call") as span:
-            with self._generation_lock:
+            with _timed_lock(self._generation_lock, GENERATION_LOCK_TIMEOUT_SECONDS):
                 logger.log(28, 'Getting LLM response...')
 
                 if self._request_params:

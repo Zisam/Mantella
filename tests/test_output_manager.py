@@ -1,4 +1,6 @@
 import pytest
+import asyncio
+import threading
 from unittest.mock import MagicMock, AsyncMock
 from src.output_manager import ChatManager
 from src.config.config_loader import ConfigLoader
@@ -12,6 +14,7 @@ from src.llm.sentence_content import SentenceTypeEnum, SentenceContent
 from src.llm.sentence import Sentence
 from src.conversation.action import Action
 from src.llm.function_client import FunctionClient
+from src.actions.function_manager import FunctionManager
 from src.llm.messages import AssistantMessage
 from tests.conftest import MockAIClient
 import time
@@ -612,3 +615,98 @@ async def test_process_response_stores_discarded_character_on_partial_response(o
     assert len(real_sentences) == 1
     assert "Thank you for your service" in real_sentences[0].content.text
     assert output_manager.discarded_character_name == "Hulda"
+
+
+class LockingMockAIClient(MockAIClient):
+    """Mimics ClientBase.streaming_call holding a threading.Lock for the generator's whole lifetime.
+
+    Reproduces the deadlock shape seen in production: the generator first yields the
+    pre-fetched tool calls, then keeps streaming (like the main LLM stream echoing another
+    tool call). If the consumer breaks out of the async for loop while the generator is
+    suspended at a yield, the sync lock stays held and the next streaming call deadlocks
+    the event loop thread forever.
+    """
+    def __init__(self, response_pattern=None, delay=0.01):
+        super().__init__(response_pattern=response_pattern, delay=delay)
+        self.generation_lock = threading.Lock()
+        self.item1_processed = threading.Event()
+
+    async def streaming_call(self, messages=None, is_multi_npc=False, tools=None):
+        if self.error_on_call:
+            raise Exception("Simulated API error")
+        self.call_count += 1
+        with self.generation_lock:
+            if tools and self.tool_calls and self.call_count == 1:
+                yield ("tool_calls", self.tool_calls)
+                await asyncio.sleep(0.2)
+                yield ("tool_calls", self.tool_calls)
+                return
+            for chunk in self.response_pattern:
+                yield ("content", chunk)
+                await asyncio.sleep(self.delay)
+
+
+@pytest.mark.asyncio
+async def test_no_deadlock_when_generation_stopped_mid_tool_stream(default_config: ConfigLoader, piper: Piper, example_skyrim_npc_character: Character, example_characters_pc_to_npc: Characters, mock_queue: SentenceQueue, mock_messages: message_thread, mock_actions: list[Action], monkeypatch):
+    """Regression test for the Follow-action deadlock.
+
+    The first streaming call yields tool calls; while the generator is between yields
+    (simulating the main LLM stream), a game-event thread calls the blocking
+    ChatManager.stop_generation (mirroring an NPC being added to the conversation
+    mid-turn). The consumer then breaks out of the async for loop with the generator
+    suspended at its yield, holding the generation lock. The turn must end cleanly
+    instead of deadlocking the event loop on the lock or looping LLM calls forever.
+    """
+    piper.synthesize = MagicMock(return_value=("mock_audio_file.wav", False))
+    monkeypatch.setattr('src.utils.get_audio_duration', lambda *args, **kwargs: 1.0)
+
+    follow_tool_call = [{
+        "id": "call_1",
+        "type": "function",
+        "function": {
+            "name": "mantella_npc_follow",
+            "arguments": "{\"source\": [\"Guard\"]}",
+        },
+    }]
+
+    client = LockingMockAIClient(response_pattern=["As you wish. Right behind you."])
+    client.tool_calls = follow_tool_call
+    manager = ChatManager(default_config, piper, client)
+    manager._ChatManager__is_generating = True
+
+    def parse_and_signal(calls, characters, game):
+        client.item1_processed.set()
+        return []
+
+    monkeypatch.setattr(FunctionManager, "parse_function_calls", staticmethod(parse_and_signal))
+
+    def game_event_thread():
+        client.item1_processed.wait(timeout=10)
+        manager.stop_generation()
+
+    stopper = threading.Thread(target=game_event_thread, daemon=True)
+
+    async def run_turn_and_start_stopper():
+        stopper.start()
+        await manager.process_response(
+            example_skyrim_npc_character,
+            mock_queue,
+            mock_messages,
+            example_characters_pc_to_npc,
+            mock_actions,
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "mantella_npc_follow",
+                    "description": "NPC follows the player",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            }],
+        )
+
+    await asyncio.wait_for(run_turn_and_start_stopper(), timeout=15)
+
+    stopper.join(timeout=5)
+    assert not stopper.is_alive(), "stop_generation never returned: the turn did not end cleanly"
+
+    assert client.call_count == 1, "second LLM call must be skipped when generation was stopped"

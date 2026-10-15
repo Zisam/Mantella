@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import aclosing
 from threading import Lock
 import time
 import unicodedata
@@ -330,149 +331,155 @@ class ChatManager:
                 while not has_text_response and retries < max_retries:
                     try:
                         start_time = time.time()
-                        async for item in active_client.streaming_call(messages=messages, is_multi_npc=is_multi_npc, tools=current_tools):
-                            if self.__stop_generation.is_set():
-                                break
-                            if not item:
-                                continue
+                        stream_gen = active_client.streaming_call(messages=messages, is_multi_npc=is_multi_npc, tools=current_tools)
+                        async with aclosing(stream_gen):
+                            async for item in stream_gen:
+                                if self.__stop_generation.is_set():
+                                    break
+                                if not item:
+                                    continue
 
-                            if first_token:
-                                logger.log(self.loglevel, f"LLM took {round(time.time() - start_time, 5)} seconds to respond")
-                                first_token = False
-                            
-                            # Handle different types of streaming data
-                            if isinstance(item, tuple) and len(item) == 2:
-                                item_type, item_data = item
-                                
-                                if item_type == "content":
-                                    # Handle regular text content
+                                if first_token:
+                                    logger.log(self.loglevel, f"LLM took {round(time.time() - start_time, 5)} seconds to respond")
+                                    first_token = False
+
+                                # Handle different types of streaming data
+                                if isinstance(item, tuple) and len(item) == 2:
+                                    item_type, item_data = item
+
+                                    if item_type == "content":
+                                        # Handle regular text content
+                                        has_text_response = True
+                                        content = item_data
+                                        raw_response += content
+                                        accumulator.accumulate(content)
+                                    elif item_type == "tool_calls":
+                                        # Collect tool calls
+                                        collected_tool_calls = item_data
+                                        logger.log(23, f"Received {len(collected_tool_calls)} tool call(s)")
+
+                                        # Add tool calls to message history
+                                        if not tool_calls_added_this_turn:
+                                            self._add_tool_calls_to_history(messages, collected_tool_calls)
+                                            tool_calls_added_this_turn = True
+
+                                        # Parse tool calls
+                                        parsed_tools = FunctionManager.parse_function_calls(collected_tool_calls, characters, game)
+
+                                        # Check if vision was requested - filter it out from game actions
+                                        vision_requested = any(
+                                            tool.get('identifier') == 'mantella_npc_vision'
+                                            for tool in parsed_tools if isinstance(tool, dict)
+                                        )
+                                        if vision_requested:
+                                            logger.log(23, "Vision requested for next LLM call")
+                                            settings.vision_requested = True
+                                            # Remove vision from parsed_tools so it doesn't go to the game
+                                            parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_npc_vision']
+
+                                        # Check if listen was requested - filter it out from game actions
+                                        listen_requested = any(
+                                            tool.get('identifier') == 'mantella_npc_listen'
+                                            for tool in parsed_tools if isinstance(tool, dict)
+                                        )
+                                        if listen_requested:
+                                            pause_seconds = FunctionManager.get_action_pause_seconds('mantella_npc_listen') or 10.0
+                                            logger.log(23, f"Listen action triggered: Pause threshold increased to {pause_seconds} seconds for one turn")
+                                            self.set_listen_requested(pause_seconds)
+                                            # Remove listen from parsed_tools so it doesn't go to the game
+                                            parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_npc_listen']
+
+                                        # Check if end conversation was requested - filter it out from game actions
+                                        end_conversation_requested = any(
+                                            tool.get('identifier') == 'mantella_end_conversation'
+                                            for tool in parsed_tools if isinstance(tool, dict)
+                                        )
+                                        if end_conversation_requested:
+                                            logger.log(23, "End conversation action triggered via tool call")
+                                            self.set_end_conversation_requested()
+                                            # Remove end_conversation from parsed_tools so it doesn't go to the game directly
+                                            parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_end_conversation']
+
+                                        # Send actions immediately as an action-only sentence (if any remain after filtering)
+                                        if parsed_tools:
+                                            # If any of the actions require an in-game response, pause text generation
+                                            requires_followup = FunctionManager.any_action_requires_response(parsed_tools)
+                                            if requires_followup:
+                                                settings.interrupting_action = True
+                                                settings.stop_generation = True
+
+                                            logger.log(23, f"Parsed actions: {parsed_tools}")
+                                            action_only_sentence = SentenceContent(active_character, "", SentenceTypeEnum.SPEECH, True, parsed_tools)
+                                            blocking_queue.put(Sentence(action_only_sentence, "", 0))
+                                else:
+                                    # Fallback for backward compatibility (if item is just a string)
                                     has_text_response = True
-                                    content = item_data
+                                    content = item
                                     raw_response += content
                                     accumulator.accumulate(content)
-                                elif item_type == "tool_calls":
-                                    # Collect tool calls
-                                    collected_tool_calls = item_data
-                                    logger.log(23, f"Received {len(collected_tool_calls)} tool call(s)")
-                                    
-                                    # Add tool calls to message history
-                                    if not tool_calls_added_this_turn:
-                                        self._add_tool_calls_to_history(messages, collected_tool_calls)
-                                        tool_calls_added_this_turn = True
-                                    
-                                    # Parse tool calls
-                                    parsed_tools = FunctionManager.parse_function_calls(collected_tool_calls, characters, game)
-                                    
-                                    # Check if vision was requested - filter it out from game actions
-                                    vision_requested = any(
-                                        tool.get('identifier') == 'mantella_npc_vision' 
-                                        for tool in parsed_tools if isinstance(tool, dict)
-                                    )
-                                    if vision_requested:
-                                        logger.log(23, "Vision requested for next LLM call")
-                                        settings.vision_requested = True
-                                        # Remove vision from parsed_tools so it doesn't go to the game
-                                        parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_npc_vision']
-                                    
-                                    # Check if listen was requested - filter it out from game actions
-                                    listen_requested = any(
-                                        tool.get('identifier') == 'mantella_npc_listen' 
-                                        for tool in parsed_tools if isinstance(tool, dict)
-                                    )
-                                    if listen_requested:
-                                        pause_seconds = FunctionManager.get_action_pause_seconds('mantella_npc_listen') or 10.0
-                                        logger.log(23, f"Listen action triggered: Pause threshold increased to {pause_seconds} seconds for one turn")
-                                        self.set_listen_requested(pause_seconds)
-                                        # Remove listen from parsed_tools so it doesn't go to the game
-                                        parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_npc_listen']
-                                    
-                                    # Check if end conversation was requested - filter it out from game actions
-                                    end_conversation_requested = any(
-                                        tool.get('identifier') == 'mantella_end_conversation' 
-                                        for tool in parsed_tools if isinstance(tool, dict)
-                                    )
-                                    if end_conversation_requested:
-                                        logger.log(23, "End conversation action triggered via tool call")
-                                        self.set_end_conversation_requested()
-                                        # Remove end_conversation from parsed_tools so it doesn't go to the game directly
-                                        parsed_tools = [t for t in parsed_tools if t.get('identifier') != 'mantella_end_conversation']
-                                    
-                                    # Send actions immediately as an action-only sentence (if any remain after filtering)
-                                    if parsed_tools:
-                                        # If any of the actions require an in-game response, pause text generation
-                                        requires_followup = FunctionManager.any_action_requires_response(parsed_tools)
-                                        if requires_followup:
-                                            settings.interrupting_action = True
-                                            settings.stop_generation = True
 
-                                        logger.log(23, f"Parsed actions: {parsed_tools}")
-                                        action_only_sentence = SentenceContent(active_character, "", SentenceTypeEnum.SPEECH, True, parsed_tools)
-                                        blocking_queue.put(Sentence(action_only_sentence, "", 0))
-                            else:
-                                # Fallback for backward compatibility (if item is just a string)
-                                has_text_response = True
-                                content = item
-                                raw_response += content
-                                accumulator.accumulate(content)
-                            
-                            # Only process sentences if we have text content
-                            if has_text_response:
-                                while accumulator.has_next_sentence():
-                                    current_sentence = accumulator.get_next_sentence()
-                                    parsed_sentence: SentenceContent | None = None
-                                    # Apply parsers
-                                    for parser in parser_chain:
-                                        if not parsed_sentence:  # Try to extract a complete sentence
-                                            parsed_sentence, current_sentence = parser.cut_sentence(current_sentence, settings)
-                                        if parsed_sentence:  # Apply modifications if we already have a sentence
-                                            parsed_sentence, pending_sentence = parser.modify_sentence_content(parsed_sentence, pending_sentence, settings)
+                                # Only process sentences if we have text content
+                                if has_text_response:
+                                    while accumulator.has_next_sentence():
+                                        current_sentence = accumulator.get_next_sentence()
+                                        parsed_sentence: SentenceContent | None = None
+                                        # Apply parsers
+                                        for parser in parser_chain:
+                                            if not parsed_sentence:  # Try to extract a complete sentence
+                                                parsed_sentence, current_sentence = parser.cut_sentence(current_sentence, settings)
+                                            if parsed_sentence:  # Apply modifications if we already have a sentence
+                                                parsed_sentence, pending_sentence = parser.modify_sentence_content(parsed_sentence, pending_sentence, settings)
+                                            if settings.stop_generation:
+                                                break
                                         if settings.stop_generation:
                                             break
+                                        accumulator.refuse(current_sentence)
+                                        # Process sentences from the parser chain
+                                        if parsed_sentence:
+                                            if not self.__config.narration_handling == NarrationHandlingEnum.CUT_NARRATIONS or parsed_sentence.sentence_type != SentenceTypeEnum.NARRATION:
+                                                if first_sentence:
+                                                    logger.log(self.loglevel, f"LLM took {round(time.time() - start_time, 5)} seconds to return the first sentence")
+                                                    first_sentence = False
+                                                new_sentence = self.generate_sentence(parsed_sentence)
+                                                blocking_queue.put(new_sentence)
+                                                parsed_sentence = None
                                     if settings.stop_generation:
                                         break
-                                    accumulator.refuse(current_sentence)
-                                    # Process sentences from the parser chain
-                                    if parsed_sentence:
-                                        if not self.__config.narration_handling == NarrationHandlingEnum.CUT_NARRATIONS or parsed_sentence.sentence_type != SentenceTypeEnum.NARRATION:
-                                            if first_sentence:
-                                                logger.log(self.loglevel, f"LLM took {round(time.time() - start_time, 5)} seconds to return the first sentence")
-                                                first_sentence = False
-                                            new_sentence = self.generate_sentence(parsed_sentence)
-                                            blocking_queue.put(new_sentence)
-                                            parsed_sentence = None
-                                if settings.stop_generation:
-                                    break
-                                if settings.interrupting_action:
-                                    # If there is an interrupting action, stop the generation after the next sentence
-                                    settings.stop_generation = True
-                        
-                        # Check if a second call is needed for a text response
-                        if collected_tool_calls and not has_text_response:
-                            # Skip second call if interrupting action detected - wait for game context instead
-                            if settings.interrupting_action:
-                                logger.log(23, "Skipping second LLM call - waiting for action response from game")
-                                break
-                            
-                            # LLM chose tools but no text - need to make second call
-                            logger.log(23, f"Making second LLM call for text response...")
-                            
-                            # If vision was requested, enable it for the next call
-                            if settings.vision_requested:
-                                active_client.enable_vision_for_next_call()
-                            
-                            # Make second call without passing tools to ensure LLM generates text
-                            current_tools = None
-                            collected_tool_calls = []  # Reset for next iteration
-                            tool_calls_added_this_turn = False  # Reset for next iteration
-                            first_token = True  # Reset for timing the second call
-                            continue  # Loop again
-                        
-                        # Store discarded character name so conversation can add corrective feedback as an in-game event
-                        if settings.discarded_character_name:
-                            self.__discarded_character_name = settings.discarded_character_name
-                            logger.log(self.loglevel, f"LLM addressed unrecognized character '{settings.discarded_character_name}'")
+                                    if settings.interrupting_action:
+                                        # If there is an interrupting action, stop the generation after the next sentence
+                                        settings.stop_generation = True
 
-                        break  # Got text response or hit an error, exit loop
+                            # Check if a second call is needed for a text response
+                            if collected_tool_calls and not has_text_response:
+                                # Skip second call if interrupting action detected - wait for game context instead
+                                if settings.interrupting_action:
+                                    logger.log(23, "Skipping second LLM call - waiting for action response from game")
+                                    break
+
+                                if self.__stop_generation.is_set():
+                                    logger.log(23, "Skipping second LLM call - generation was stopped")
+                                    break
+
+                                # LLM chose tools but no text - need to make second call
+                                logger.log(23, f"Making second LLM call for text response...")
+
+                                # If vision was requested, enable it for the next call
+                                if settings.vision_requested:
+                                    active_client.enable_vision_for_next_call()
+
+                                # Make second call without passing tools to ensure LLM generates text
+                                current_tools = None
+                                collected_tool_calls = []  # Reset for next iteration
+                                tool_calls_added_this_turn = False  # Reset for next iteration
+                                first_token = True  # Reset for timing the second call
+                                continue  # Loop again
+
+                            # Store discarded character name so conversation can add corrective feedback as an in-game event
+                            if settings.discarded_character_name:
+                                self.__discarded_character_name = settings.discarded_character_name
+                                logger.log(self.loglevel, f"LLM addressed unrecognized character '{settings.discarded_character_name}'")
+
+                            break  # Got text response or hit an error, exit loop
                                 
                     except Exception as e:
                         retries += 1
