@@ -20,7 +20,7 @@ class conversation_log:
             conversation_history_file = conversation_log.__get_path_to_conversation_history_file(character, world_id)
             # transformed_messages = messages.transform_to_openai_messages(messages.get_talk_only())
             if os.path.exists(conversation_history_file):
-                with open(conversation_history_file, 'r', encoding='utf-8') as f:
+                with open(conversation_history_file, 'r', encoding='utf-8-sig') as f:
                     conversation_history = json.load(f)
 
                 # add new conversation to conversation history
@@ -39,7 +39,7 @@ class conversation_log:
     def load_conversation_log(character: Character, world_id: str) -> list[str]:
         conversation_history_file = conversation_log.__get_path_to_conversation_history_file(character, world_id)
         if os.path.exists(conversation_history_file):
-            with open(conversation_history_file, 'r', encoding='utf-8') as f:
+            with open(conversation_history_file, 'r', encoding='utf-8-sig') as f:
                 conversation_history = json.load(f)
             previous_conversations = []
             for conversation in conversation_history:
@@ -53,7 +53,7 @@ class conversation_log:
     def get_conversation_log_length(character: Character, world_id: str) -> int:
         conversation_history_file = conversation_log.__get_path_to_conversation_history_file(character, world_id)
         if os.path.exists(conversation_history_file):
-            with open(conversation_history_file, 'r', encoding='utf-8') as f:
+            with open(conversation_history_file, 'r', encoding='utf-8-sig') as f:
                 conversation_history = json.load(f)
             return sum(len(conversation) for conversation in conversation_history)
         else:
