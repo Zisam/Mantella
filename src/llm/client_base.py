@@ -263,6 +263,7 @@ class ClientBase(AIClient):
                     request_params: dict[str, Any] = {}
                 if is_multi_npc: # override max_tokens to be at least 250 in radiant / multi-NPC conversations
                     request_params["max_tokens"] = max(self.max_tokens_param, 250)
+                async_client: AsyncOpenAI | None = None # bound upfront so the finally block is safe if the generator is closed at the tool_calls yield
                 try:
                     # Prepare the messages including the image if provided
                     vision_hints = ''
