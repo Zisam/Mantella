@@ -265,6 +265,7 @@ class ClientBase(AIClient):
                 if is_multi_npc: # override max_tokens to be at least 250 in radiant / multi-NPC conversations
                     request_params["max_tokens"] = max(self.max_tokens_param, 250)
                 async_client: AsyncOpenAI | None = None # bound upfront so the finally block is safe if the generator is closed at the tool_calls yield
+                function_task: asyncio.Task | None = None # bound upfront for the same reason
                 try:
                     # Prepare the messages including the image if provided
                     vision_hints = ''
@@ -288,7 +289,6 @@ class ClientBase(AIClient):
                         self._enable_vision_next_call = False  # Reset flag after use
 
                     # Handle tool calling: use dedicated function client if available, otherwise use main LLM
-                    function_task = None
                     if tools:
                         if self._function_client:
                             # Run the function LLM concurrently with the main stream: a slow action check
@@ -384,6 +384,11 @@ class ClientBase(AIClient):
                     else:
                         logger.error(f"LLM API Streaming Error: {e}")
                 finally:
+                    # If the generator is closed early (stop generation, stream error), the concurrently
+                    # running action check is no longer needed; cancel the wrapper (the worker thread
+                    # itself runs to completion in the background)
+                    if function_task is not None and not function_task.done():
+                        function_task.cancel()
                     if async_client:
                         await async_client.close()
 
