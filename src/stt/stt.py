@@ -89,7 +89,19 @@ class Transcriber:
         if (self.stt_service == 'whisper') and (self.__api_key) and ('openai' in self.whisper_url) and (self.external_whisper_service):
             self.__initial_client = self.__generate_sync_client() # initialize first client in advance to save time
 
-        self.__ignore_list = ['', 'thank you', 'thank you for watching', 'thanks for watching', 'the transcript is from the', 'the', 'thank you very much', "thank you for watching and i'll see you in the next video", "we'll see you in the next video", 'see you next time']
+        self.__ignore_list = ['', 'thank you', 'thank you for watching', 'thanks for watching', 'the transcript is from the', 'the', 'thank you very much', "thank you for watching and i'll see you in the next video", "we'll see you in the next video", 'see you next time',
+                              # common Russian Whisper hallucinations (YouTube subtitle artifacts)
+                              'канал', 'продолжение следует', 'спасибо за просмотр', 'приятного просмотра', 'подписывайтесь на канал', 'подпишитесь на канал', 'до новых встреч', 'субтитры', 'оставляйте комментарии', 'оставляйте свои комментарии', 'ставьте лайки', 'не забудьте подписаться на канал']
+        # Distinctive YouTube-subtitle artifacts; used for substring matching on SHORT transcriptions only,
+        # so longer legitimate lines that merely mention these words still pass through.
+        # Deliberately excludes phrases a player may legitimately say ('добро пожаловать', 'до новых встреч')
+        # and surnames that are prefixes of real words ('негода' -> 'негодование'); those are covered
+        # by other markers or by the exact-match ignore list above
+        self.__hallucination_markers = ['продолжение следует', 'спасибо за просмотр', 'приятного просмотра',
+                                        'подписывайтесь', 'подпишитесь', 'ставьте лайки',
+                                        'наш канал', 'субтитр', 'закомолдина', 'семкин',
+                                        'бойкова', 'сухиашвили', 'с вами был', 'не переключайтесь',
+                                        'оставайтесь на']
 
         if has_moonshine:
             self.transcribe_model: WhisperModel | MoonshineOnnxModel | None = None
@@ -147,8 +159,18 @@ class Transcriber:
         self._last_update_time = 0
         self._current_transcription = ""
         self._transcription_ready = threading.Event()
+        self._listening_cancelled = False # set by stop_listening to wake blocked get_latest_transcription waiters
         self._consecutive_empty_count = 0
         self._max_consecutive_empty = 10
+
+    def __is_whisper_hallucination(self, text: str) -> bool:
+        """Exact matches are always dropped; short utterances containing known hallucination markers are dropped too"""
+        cleaned = utils.clean_text(text)
+        if cleaned in self.__ignore_list:
+            return True
+        if len(cleaned.split()) <= 6:
+            return any(marker in cleaned for marker in self.__hallucination_markers)
+        return False
 
     @property
     def is_listening(self) -> bool:
@@ -172,9 +194,8 @@ class Transcriber:
         """
         with self._lock:
             self._temporary_pause_override = pause_seconds
-            # If already listening and speech hasn't been detected yet, recreate VAD iterator with new pause threshold
-            if self._running and not self._speech_detected:
-                self.vad_iterator = self._create_vad_iterator()
+            # Note: no VAD iterator needs recreating here; the pause threshold is applied
+            # per chunk in _process_vad_chunk from _temporary_pause_override / pause_threshold
         
 
     @utils.time_it
@@ -250,9 +271,9 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
     @utils.time_it
     def whisper_transcribe(self, audio: np.ndarray, prompt: str):
         if self.transcribe_model: # local model
-            segments, _ = self.transcribe_model.transcribe(audio, task=self.task, language=self.language, beam_size=5, vad_filter=False, initial_prompt=prompt)
+            segments, _ = self.transcribe_model.transcribe(audio, task=self.task, language=self.language, beam_size=5, vad_filter=True, initial_prompt=prompt)
             result_text = ' '.join(segment.text for segment in segments)
-            if utils.clean_text(result_text) in self.__ignore_list: # common phrases hallucinated by Whisper
+            if self.__is_whisper_hallucination(result_text): # common phrases hallucinated by Whisper
                 return ''
             return result_text
         
@@ -285,7 +306,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
                     logger.error(f'STT error: {e}')
                 input("Press Enter to exit.")
             client.close()
-            if utils.clean_text(response_data.text) in self.__ignore_list: # common phrases hallucinated by Whisper
+            if self.__is_whisper_hallucination(response_data.text): # common phrases hallucinated by Whisper
                 return ''
             return response_data.text.strip()
         else: # custom server model
@@ -296,7 +317,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
                 logger.error(f'STT Error: {response.content}')
             response_data = json.loads(response.text)
             if 'text' in response_data:
-                if utils.clean_text(response_data['text']) in self.__ignore_list: # common phrases hallucinated by Whisper
+                if self.__is_whisper_hallucination(response_data['text']): # common phrases hallucinated by Whisper
                     return ''
                 return response_data['text'].strip()
             
@@ -329,42 +350,56 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
     @utils.time_it
     def start_listening(self, prompt: str = '') -> None:
         '''Start background listening thread'''
-        if self._running:
-            return
-            
-        self._running = True
-        self._reset_state()
-        self.prompt = prompt
-        
-        # Start audio stream
-        from sounddevice import InputStream
-        self._stream = InputStream(
-            samplerate=self.SAMPLING_RATE,
-            channels=1,
-            blocksize=self.CHUNK_SIZE,
-            dtype=np.float32,
-            callback=self._create_input_callback(self._audio_queue),
-            latency = 'low'
-        )
-        self._stream.start()
-        
-        # Start processing thread
-        self._processing_thread = threading.Thread(
-            target=self._process_audio,
-            daemon = True
-        )
-        self._processing_thread.start()
+        # The lock pairs with stop_listening so a concurrent stop cannot tear down the
+        # stream/thread of a session that has just started (and vice versa)
+        with self._lock:
+            if self._running:
+                return
+
+            self._running = True
+            self._listening_cancelled = False
+            self._transcription_ready.clear() # clear any leftover wake-up from a previous stop_listening call
+            self._current_transcription = '' # drop any stale transcription from a previous session
+            self._reset_state()
+            self.prompt = prompt
+
+            # A fresh queue per session: a stop_listening tail still cleaning up the previous
+            # session must never steal chunks from (or clobber the state of) this new one
+            audio_queue = queue.Queue()
+            self._audio_queue = audio_queue
+
+            # Start audio stream
+            from sounddevice import InputStream
+            stream = InputStream(
+                samplerate=self.SAMPLING_RATE,
+                channels=1,
+                blocksize=self.CHUNK_SIZE,
+                dtype=np.float32,
+                callback=self._create_input_callback(audio_queue),
+                latency = 'low'
+            )
+            stream.start()
+            self._stream = stream
+
+            # Start processing thread
+            # (the thread acquires self._lock per chunk, so it waits here until we release it)
+            self._processing_thread = threading.Thread(
+                target=self._process_audio,
+                args=(audio_queue,),
+                daemon = True
+            )
+            self._processing_thread.start()
         logger.log(self.loglevel, 'Listening...')
 
 
-    def _process_audio(self) -> None:
+    def _process_audio(self, audio_queue: queue.Queue) -> None:
         """Process audio data in a separate thread."""
         lookback_size = self.LOOKBACK_CHUNKS * self.CHUNK_SIZE
         chunk_count = 0
-        
+
         while self._running:
             try:
-                chunk, status = self._audio_queue.get(timeout=0.1)
+                chunk, status = audio_queue.get(timeout=0.1)
                 if status:
                     if self.__processing_audio_error_count % self.__warning_frequency == 0:
                         logger.log(23, f"STT WARNING: Processing audio error: {status}")
@@ -538,6 +573,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
     def _save_audio(self, audio: np.ndarray) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_path = os.path.join(self.__mic_input_path, f'mic_input_{timestamp}.wav')
+        os.makedirs(self.__mic_input_path, exist_ok=True)
         with wave.open(audio_path, 'wb') as wf:
             wf.setnchannels(1)  # Mono audio
             wf.setsampwidth(2)  # 16-bit audio
@@ -563,7 +599,13 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
             timeout_value = silence_timeout if use_timeout else None
             
             received_transcription = self._transcription_ready.wait(timeout=timeout_value)
-            
+
+            if self._listening_cancelled:
+                # stop_listening was called (e.g. the conversation ended) while we were
+                # waiting on the microphone; return instead of blocking forever
+                logger.log(self.loglevel, 'Listening cancelled before speech was detected')
+                return None
+
             if not received_transcription and use_timeout and not self._speech_detected:
                 logger.log(self.loglevel, f"Silence timeout of {silence_timeout} seconds reached without speech")
                 return None
@@ -593,39 +635,37 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
 
     def stop_listening(self) -> None:
         """Stop listening for speech."""
-        if not self._running:
-            return
-            
-        self._running = False
-        self._speech_detected = False
-        
-        # Stop and clean up audio stream
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        
-        # Wait for processing thread to finish
-        if self._processing_thread:
-            self._processing_thread.join()  # timeout=1.0 Add timeout to prevent hanging
-            self._processing_thread = None
-        
-        # Clear queue
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        # Drop any transcription that was finalized but never consumed, so it cannot trigger a "phantom"
-        # interruption or be picked up as stale input at the start of the next conversation
         with self._lock:
+            # Always wake blocked get_latest_transcription waiters, even if no session is
+            # running (a waiter can block on the mic without a listening session started)
+            self._listening_cancelled = True
+            self._transcription_ready.set()
+            if not self._running:
+                return
+
+            self._running = False
             self._speech_detected = False
-            self._has_unconsumed_transcription = False
-            self._current_transcription = ''
-            self._transcription_ready.clear()
-                
-        self._reset_state()
+            # Capture the current stream/thread under the lock so a start_listening call
+            # that races us cannot have its fresh session torn down instead of ours
+            stream, self._stream = self._stream, None
+            processing_thread, self._processing_thread = self._processing_thread, None
+
+        # Stop and clean up audio stream (outside the lock: the processing thread needs it)
+        if stream:
+            stream.stop()
+            stream.close()
+
+        # Wait for processing thread to finish
+        if processing_thread:
+            processing_thread.join()  # timeout=1.0 Add timeout to prevent hanging
+
+        # The session's audio queue dies with the session (a new start_listening call has
+        # created its own), so there is nothing left to drain
+        with self._lock:
+            if not self._running:
+                # No new session started while we were cleaning up: safe to clear stale state
+                self._current_transcription = ''
+                self._reset_state()
         logger.log(self.loglevel, 'Stopped listening for mic input')
 
 
