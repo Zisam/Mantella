@@ -56,8 +56,8 @@ class GameStateManager:
     @utils.time_it
     def start_conversation(self, input_json: dict[str, Any]) -> dict[str, Any]:
         if self.__talk: #This should only happen if game and server are out of sync due to some previous error -> close conversation and start a new one
-            self.__talk.end()
-            self.__talk = None
+            talk, self.__talk = self.__talk, None # null first so a parallel end_conversation request cannot end the same talk twice
+            talk.end()
 
         world_id = "default"
         if input_json.__contains__(comm_consts.KEY_STARTCONVERSATION_WORLDID):
@@ -115,25 +115,27 @@ class GameStateManager:
     def continue_conversation(self, input_json: dict[str, Any]) -> dict[str, Any]:
         if(not self.__talk ):
             return self.error_message("No running conversation.")
-        
+
+        talk = self.__talk # keep a local reference: an unserialized end_conversation request can null self.__talk while this method runs
+
         # comm_consts.KEY_INPUTTYPE is passed when the mic settings have been changed in the MCM since beginning the conversation
         # If this happens, switch the STT settings to match the new input type
         if input_json.__contains__(comm_consts.KEY_INPUTTYPE):
             self.process_stt_setup(input_json)
-        
+
         if self.__should_reload:
-            self.__talk.reload_conversation()
+            talk.reload_conversation()
             self.__should_reload = False
 
         topicInfoID: int = int(input_json.get(comm_consts.KEY_CONTINUECONVERSATION_TOPICINFOFILE,1))
 
         self.__update_context(input_json)
 
-        if self.__talk.resume_after_interrupting_action():
+        if talk.resume_after_interrupting_action():
             logger.log(23, "Resuming conversation after interrupting action result")
 
         while True:
-            replyType, sentence_to_play = self.__talk.continue_conversation()
+            replyType, sentence_to_play = talk.continue_conversation()
             if replyType == comm_consts.KEY_REQUESTTYPE_TTS:
                 # Player input was detected mid-response: tell the game to cut the current voiceline
                 # the game follows up with a player input request, which goes through player_input() normally
@@ -161,7 +163,7 @@ class GameStateManager:
 
         if sentence_to_play:
             if not sentence_to_play.error_message:
-                self.__game.prepare_sentence_for_game(sentence_to_play, self.__talk.context, self.__config, topicInfoID, self.__first_line)            
+                self.__game.prepare_sentence_for_game(sentence_to_play, talk.context, self.__config, topicInfoID, self.__first_line)
                 reply[comm_consts.KEY_REPLYTYPE_NPCTALK] = self.sentence_to_json(sentence_to_play, topicInfoID)
                 self.__first_line = False
 
@@ -169,25 +171,31 @@ class GameStateManager:
                     # Reload on next continue, but first inform the player that a reload will happen with the "gather thoughts" voiceline
                     self.__should_reload = True
             else:
-                self.__talk.end()
-                return self.error_message(sentence_to_play.error_message)        
+                talk.end()
+                return self.error_message(sentence_to_play.error_message)
         return reply
 
     @utils.time_it
     def player_input(self, input_json: dict[str, Any]) -> dict[str, Any]:
         if(not self.__talk ):
             return self.error_message("No running conversation.")
-        
+
+        talk = self.__talk # keep a local reference: the conversation can be ended (self.__talk = None) while process_player_input blocks on mic input
         self.__first_line = True
-        
+
         player_text: str = input_json.get(comm_consts.KEY_REQUESTTYPE_PLAYERINPUT, '')
         self.__update_context(input_json)
-        updated_player_text, update_events, player_spoken_sentence = self.__talk.process_player_input(player_text)
+        updated_player_text, update_events, player_spoken_sentence = talk.process_player_input(player_text)
+        if self.__talk is not talk:
+            # end_conversation was processed while we were waiting for the player to speak;
+            # the conversation is over, so return a benign empty reply instead of touching a dead conversation
+            logger.log(23, 'Conversation ended while waiting for player input')
+            return {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTYPE_NPCTALK}
         if update_events:
             return {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REQUESTTYPE_TTS, comm_consts.KEY_TRANSCRIBE: updated_player_text}
 
         cleaned_player_text = utils.clean_text(updated_player_text)
-        npcs_in_conversation = self.__talk.context.npcs_in_conversation
+        npcs_in_conversation = talk.context.npcs_in_conversation
         for action in self.__config.actions:
             # if the player response is just the name of an action, force the action to trigger
             if action.keyword.lower() == cleaned_player_text.lower().replace(' ','') and npcs_in_conversation.last_added_character:
@@ -198,13 +206,13 @@ class GameStateManager:
                     self.__chat_manager.set_listen_requested(pause_seconds)
                     logger.log(23, f"Listen action triggered via keyword: Pause threshold increased to {pause_seconds} seconds for one turn")
                     break # Don't send to game
-                
+
                 if action.identifier == 'mantella_npc_vision':
                     # Enable vision for the next LLM call
                     self.__client.enable_vision_for_next_call()
                     logger.log(23, "Vision action triggered via keyword: Vision enabled for next LLM call")
                     break # Don't send to game
-                
+
                 # Note: the game ignores mantella_actor_speaker for actions and instead targets the last NPC to speak
                 return {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTYPE_NPCACTION,
                         comm_consts.KEY_REPLYTYPE_NPCACTION: {
@@ -216,7 +224,7 @@ class GameStateManager:
         # if the player response is not an action command, return a regular player reply type
         if player_spoken_sentence:
             topicInfoID: int = int(input_json.get(comm_consts.KEY_CONTINUECONVERSATION_TOPICINFOFILE,1))
-            self.__game.prepare_sentence_for_game(player_spoken_sentence, self.__talk.context, self.__config, topicInfoID, self.__first_line)
+            self.__game.prepare_sentence_for_game(player_spoken_sentence, talk.context, self.__config, topicInfoID, self.__first_line)
             self.__first_line = False
             return {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTYPE_NPCTALK, comm_consts.KEY_REPLYTYPE_NPCTALK: self.sentence_to_json(player_spoken_sentence, topicInfoID)}
         else:
@@ -224,11 +232,14 @@ class GameStateManager:
 
     @utils.time_it
     def end_conversation(self, input_json: dict[str, Any]) -> dict[str, Any]:
-        if(self.__talk):
-            # Extract end timestamp from game client
-            end_timestamp = input_json.get(comm_consts.KEY_ENDCONVERSATION_TIMESTAMP, None)
-            self.__talk.end(end_timestamp)
+        # Extract end timestamp from game client
+        end_timestamp = input_json.get(comm_consts.KEY_ENDCONVERSATION_TIMESTAMP, None)
+        talk = self.__talk
+        if talk:
+            # Null the reference first so a concurrent end_conversation request
+            # (this route bypasses the request lock) cannot end the same conversation twice
             self.__talk = None
+            talk.end(end_timestamp)
 
         logger.log(24, '\nConversations not starting when you select an NPC? See here:')
         logger.log(25, 'https://art-from-the-machine.github.io/Mantella/pages/issues_qna')

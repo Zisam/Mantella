@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import threading
 from typing import Any
 
 from fastapi import FastAPI
@@ -15,6 +16,9 @@ class routeable(ABC):
         self._has_route_been_initialized: bool = False
         self._log_level_http_in = 41
         self._log_level_http_out = 42
+        # Serializes the check-then-rebuild sequence in _can_route_be_used across all
+        # route handlers, including ones that bypass the per-route asyncio lock
+        self._setup_lock = threading.Lock()
 
     @abstractmethod
     def add_route_to_server(self, app: FastAPI):
@@ -26,17 +30,18 @@ class routeable(ABC):
         pass
 
     @utils.time_it
-    def _can_route_be_used(self) -> bool:        
-        if not self._has_route_been_initialized or self._config.has_any_config_value_changed:
-            self._config.update_config_loader_with_changed_config_values()
-            if self._config.have_all_config_values_loaded_correctly:
-                self._setup_route()
-                self._has_route_been_initialized = True
-                return True
-            else:
-                self._has_route_been_initialized = False
-                return False
-        return self._has_route_been_initialized
+    def _can_route_be_used(self) -> bool:
+        with self._setup_lock:
+            if not self._has_route_been_initialized or self._config.has_any_config_value_changed:
+                self._config.update_config_loader_with_changed_config_values()
+                if self._config.have_all_config_values_loaded_correctly:
+                    self._setup_route()
+                    self._has_route_been_initialized = True
+                    return True
+                else:
+                    self._has_route_been_initialized = False
+                    return False
+            return self._has_route_been_initialized
     
     @abstractmethod
     def _setup_route(self):

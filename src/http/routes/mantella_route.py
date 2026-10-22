@@ -1,7 +1,9 @@
+import asyncio
 import json
 from typing import Any, Hashable
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from src.config.config_loader import ConfigLoader
 from src.games.fallout4 import Fallout4
 from src.games.gameable import Gameable
@@ -32,6 +34,8 @@ class mantella_route(routeable):
         super().__init__(config)
         self.__language_info: dict[Hashable, str] = language_info
         self.__game: GameStateManager | None = None
+        # Serializes all conversation requests except end_conversation (see add_route_to_server)
+        self._route_lock = asyncio.Lock()
 
         # if not self._can_route_be_used():
         #     error_message = "MantellaSoftware settings faulty. Please check MantellaSoftware's window or log."
@@ -64,14 +68,6 @@ class mantella_route(routeable):
     def add_route_to_server(self, app: FastAPI):
         @app.post("/mantella")
         async def mantella(request: Request):
-            if not self._can_route_be_used():
-                error_message = "MantellaSoftware settings faulty. Please check MantellaSoftware's window or log."
-                logger.error(error_message)
-                return self.error_message(error_message)
-            if not self.__game:
-                error_message = "Game manager setup failed. There is most likely an issue with the config.ini."
-                logger.error(error_message)
-                return self.error_message(error_message)
             reply = {}
             received_json: dict[str, Any] | None = await request.json()
             if received_json:
@@ -79,21 +75,45 @@ class mantella_route(routeable):
                 if self._config.show_http_debug_messages:
                     logger.log(self._log_level_http_in, json.dumps(received_json, indent=4))
                 request_type: str = received_json[comm_consts.KEY_REQUESTTYPE]
-                match request_type:
-                    case comm_consts.KEY_REQUESTTYPE_INIT:
-                        # nothing needs to be done for this request aside from self._can_route_be_used() being triggered
-                        logger.debug('Mantella settings initialized')
-                        reply = {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTTYPE_INITCOMPLETED}
-                    case comm_consts.KEY_REQUESTTYPE_STARTCONVERSATION:
-                        reply = self.__game.start_conversation(received_json)
-                    case comm_consts.KEY_REQUESTTYPE_CONTINUECONVERSATION:
-                        reply = self.__game.continue_conversation(received_json)
-                    case comm_consts.KEY_REQUESTTYPE_PLAYERINPUT:
-                        reply = self.__game.player_input(received_json)
-                    case comm_consts.KEY_REQUESTTYPE_ENDCONVERSATION:
-                        reply = self.__game.end_conversation(received_json)
-                    case _:
-                        reply = self.error_message(f"Request type '{request_type}' was not recognized")
+                if request_type == comm_consts.KEY_REQUESTTYPE_ENDCONVERSATION:
+                    # Ending a conversation must never wait for other requests:
+                    # player_input can block on mic input indefinitely, and the game
+                    # needs end_conversation to be processed during that wait
+                    if not await run_in_threadpool(self._can_route_be_used):
+                        error_message = "MantellaSoftware settings faulty. Please check MantellaSoftware's window or log."
+                        logger.error(error_message)
+                        return self.error_message(error_message)
+                    game = self.__game # capture once; _can_route_be_used may have just rebuilt it
+                    if not game:
+                        error_message = "Game manager setup failed. There is most likely an issue with the config.ini."
+                        logger.error(error_message)
+                        return self.error_message(error_message)
+                    reply = await run_in_threadpool(game.end_conversation, received_json)
+                else:
+                    # All other requests are serialized to preserve single-threaded
+                    # conversation semantics (only end_conversation may run in parallel)
+                    async with self._route_lock:
+                        if not await run_in_threadpool(self._can_route_be_used):
+                            error_message = "MantellaSoftware settings faulty. Please check MantellaSoftware's window or log."
+                            logger.error(error_message)
+                            return self.error_message(error_message)
+                        if not self.__game:
+                            error_message = "Game manager setup failed. There is most likely an issue with the config.ini."
+                            logger.error(error_message)
+                            return self.error_message(error_message)
+                        match request_type:
+                            case comm_consts.KEY_REQUESTTYPE_INIT:
+                                # nothing needs to be done for this request aside from self._can_route_be_used() being triggered
+                                logger.debug('Mantella settings initialized')
+                                reply = {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTTYPE_INITCOMPLETED}
+                            case comm_consts.KEY_REQUESTTYPE_STARTCONVERSATION:
+                                reply = await run_in_threadpool(self.__game.start_conversation, received_json)
+                            case comm_consts.KEY_REQUESTTYPE_CONTINUECONVERSATION:
+                                reply = await run_in_threadpool(self.__game.continue_conversation, received_json)
+                            case comm_consts.KEY_REQUESTTYPE_PLAYERINPUT:
+                                reply = await run_in_threadpool(self.__game.player_input, received_json)
+                            case _:
+                                reply = self.error_message(f"Request type '{request_type}' was not recognized")
             else:
                 reply = self.error_message(f"Request did not contain properly formatted json!")
 

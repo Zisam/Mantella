@@ -146,6 +146,11 @@ class Conversation:
         if self.__interruption_enabled() and not self.__stt.is_listening:
             mic_prompt = self.__get_mic_prompt()
             self.__stt.start_listening(mic_prompt)
+            if self.__has_already_ended:
+                # The conversation was ended between the is_listening check above and
+                # start_listening: stop the mic session just started for a dead conversation
+                self.__stt.stop_listening()
+                return comm_consts.KEY_REPLYTYPE_ENDCONVERSATION, None
         
         #Grab the next sentence from the queue
         next_sentence: Sentence | None = self.retrieve_sentence_from_queue()
@@ -253,6 +258,11 @@ class Conversation:
                 
                 if not self.__stt.is_listening and self.__allow_mic_input:
                     self.__stt.start_listening(self.__get_mic_prompt())
+                    if self.__has_already_ended:
+                        # The conversation was ended between the is_listening check above and
+                        # start_listening: stop the mic session just started for a dead conversation
+                        self.__stt.stop_listening()
+                        return '', False, None
                 
                 # Use timeout if timeout is enabled, max count is not reached, and Listen mode is not active
                 use_silence_timeout = (self.__silence_auto_response_enabled and 
@@ -279,6 +289,11 @@ class Conversation:
                         # Player spoke -> reset the silence counter
                         self.__silence_auto_response_count = 0
                     
+                if self.__has_already_ended:
+                    # The conversation was ended (e.g. via an end_conversation request) while we were
+                    # blocked on the microphone; do not generate anything for the dead conversation
+                    return '', False, None
+
                 if time.time() - input_wait_start_time >= self.__events_refresh_time:
                     # If too much time has passed, in-game events need to be updated
                     events_need_updating = True
@@ -479,11 +494,21 @@ class Conversation:
     @utils.time_it
     def end(self, end_timestamp: float | None = None):
         """Ends a conversation
-        
+
         Args:
             end_timestamp: Optional game timestamp (days passed as float) when conversation ends
         """
+        if self.__has_already_ended:
+            # Idempotency guard: concurrent end paths (end_conversation request, a new
+            # start_conversation cleaning up, an error path) must not save the
+            # conversation summary twice
+            return
         self.__has_already_ended = True
+        # Wake any player_input request blocked on the microphone (end_conversation runs in
+        # parallel to it); without this the blocked request would hold its caller forever
+        if self.__stt:
+            self.__stt.stop_listening()
+        self.__allow_mic_input = False
         self.__stop_generation()
         self.__sentences.clear()
         self.__save_conversation(is_reload=False, end_timestamp=end_timestamp)
