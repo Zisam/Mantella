@@ -107,3 +107,20 @@ class TestXTTSStreamedSynthesis:
         played_externally = streaming_xtts.tts_synthesize('Hello there.', str(tmp_path / 'out.wav'), first_line_options)
 
         assert played_externally is True
+
+
+class TestXTTSEllipsisCollapse:
+    # XTTS voices trailing ellipses as the Portuguese word "ponto" — they must be
+    # collapsed to a single period in every synthesis payload (streamed or not)
+    def test_trailing_ellipsis_is_collapsed_to_period(self, streaming_xtts: XTTS):
+        payload = streaming_xtts._build_synthesis_payload('Ну ладно... подумаем ещё...')
+        assert payload['text'] == 'Ну ладно. подумаем ещё.'
+
+    def test_ellipsis_char_is_replaced(self, streaming_xtts: XTTS):
+        payload = streaming_xtts._build_synthesis_payload('Я тут подумал… может, домой?')
+        assert payload['text'] == 'Я тут подумал. может, домой?'
+
+    def test_normal_punctuation_is_untouched(self, streaming_xtts: XTTS):
+        line = 'Жива-жива. Кто тронет — убью!'
+        payload = streaming_xtts._build_synthesis_payload(line)
+        assert payload['text'] == line

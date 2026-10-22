@@ -87,6 +87,12 @@ class TTSable(ABC):
 
         logger.log(22, f'Synthesizing voiceline: {voiceline.strip()}')
 
+        # Self-heal output folders: if the tmp folder is wiped mid-session (e.g. by a
+        # concurrent Mantella instance cleanup), os.rename below would silently fail
+        # and the generation thread would later crash on the missing file
+        os.makedirs(self._voiceline_folder, exist_ok=True)
+        os.makedirs(f"{self._voiceline_folder}/save", exist_ok=True)
+
         final_voiceline_file_name = 'out' # "out" is the file name used by XTTS
         final_voiceline_file =  f"{self._voiceline_folder}/{final_voiceline_file_name}.wav"
 
