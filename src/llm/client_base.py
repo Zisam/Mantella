@@ -4,6 +4,7 @@ from typing import AsyncGenerator, Any
 from enum import Enum
 from openai import APIConnectionError, BadRequestError, OpenAI, AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletion
+import asyncio
 import time
 import tiktoken
 import json
@@ -287,11 +288,12 @@ class ClientBase(AIClient):
                         self._enable_vision_next_call = False  # Reset flag after use
 
                     # Handle tool calling: use dedicated function client if available, otherwise use main LLM
+                    function_task = None
                     if tools:
                         if self._function_client:
-                            pre_fetched_tool_calls = self._function_client.check_for_actions(messages, tools)
-                            if pre_fetched_tool_calls:
-                                yield ("tool_calls", pre_fetched_tool_calls)
+                            # Run the function LLM concurrently with the main stream: a slow action check
+                            # must not delay the first voiceline past the game plugin's request timeout
+                            function_task = asyncio.create_task(asyncio.to_thread(self._function_client.check_for_actions, messages, tools))
                         else:
                             # If custom function LLM isn't enabled, let the main LLM handle tool calling as well as text generation
                             request_params["tools"] = tools
@@ -357,6 +359,12 @@ class ClientBase(AIClient):
                     if accumulated_tool_calls:
                         tool_calls_list = [accumulated_tool_calls[i] for i in sorted(accumulated_tool_calls.keys())]
                         yield ("tool_calls", tool_calls_list)
+
+                    # Yield the pre-fetched tool calls from the (concurrently run) function LLM
+                    if function_task is not None:
+                        pre_fetched_tool_calls = await function_task
+                        if pre_fetched_tool_calls:
+                            yield ("tool_calls", pre_fetched_tool_calls)
                 except Exception as e:
                     utils.play_error_sound()
                     if isinstance(e, APIConnectionError):

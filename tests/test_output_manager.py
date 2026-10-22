@@ -99,6 +99,20 @@ async def test_process_response_api_error(output_manager: ChatManager, example_s
 
 
 @pytest.mark.asyncio
+async def test_process_response_retries_empty_stream(output_manager: ChatManager, example_skyrim_npc_character: Character, example_characters_pc_to_npc: Characters, mock_queue: SentenceQueue, mock_messages: message_thread, mock_actions: list[Action], monkeypatch):
+    """Test that a stream which completes without any text or tool calls is retried instead of ending the conversation"""
+    empty_client = MockAIClient(response_pattern=[])
+    output_manager._ChatManager__client = empty_client
+    monkeypatch.setattr("src.utils.play_error_sound", lambda *a, **kw: None)
+    monkeypatch.setattr(time, "sleep", lambda *a, **kw: None)
+
+    await output_manager.process_response(example_skyrim_npc_character, mock_queue, mock_messages, example_characters_pc_to_npc, mock_actions, tools=None)
+
+    # an empty stream must be retried up to max_retries, not silently kill the conversation
+    assert empty_client.call_count == 5
+
+
+@pytest.mark.asyncio
 async def test_process_response_actions(output_manager: ChatManager, example_skyrim_npc_character: Character, example_characters_pc_to_npc: Characters, mock_queue: SentenceQueue, mock_messages: message_thread, mock_actions: list[Action]):
     """Test processing of actions embedded in the response"""
     output_manager._ChatManager__client.response_pattern = ["Wave: ", "See ", "you ", "later."]

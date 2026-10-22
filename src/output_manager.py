@@ -479,6 +479,14 @@ class ChatManager:
                                 self.__discarded_character_name = settings.discarded_character_name
                                 logger.log(self.loglevel, f"LLM addressed unrecognized character '{settings.discarded_character_name}'")
 
+                            if not has_text_response and not collected_tool_calls and not settings.stop_generation and not self.__stop_generation.is_set():
+                                # An empty stream (aborted connection, upstream flake) must not kill the conversation
+                                retries += 1
+                                logger.warning(f"LLM returned an empty response, retrying ({retries}/{max_retries})")
+                                if retries < max_retries:
+                                    first_token = True
+                                    continue
+
                             break  # Got text response or hit an error, exit loop
                                 
                     except Exception as e:
