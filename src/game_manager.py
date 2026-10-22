@@ -354,6 +354,13 @@ class GameStateManager:
                 base_id = base_id[-6:]
 
             character_name: str = str(json[comm_consts.KEY_ACTOR_NAME])
+            if not character_name.strip():
+                # A malformed actor (empty name) from the game scrambles the conversation
+                # roster: it creates a blank participant entry and can displace the player
+                # slot (seen as another NPC being listed as "the player"), which silences
+                # that NPC for the rest of the session
+                logger.warning(f"Skipping actor with empty name (base_id: {base_id}, ref_id: {ref_id})")
+                return None
             gender: int = int(json[comm_consts.KEY_ACTOR_GENDER])
             race: str = str(json[comm_consts.KEY_ACTOR_RACE])
             actor_voice_model: str = str(json[comm_consts.KEY_ACTOR_VOICETYPE])
