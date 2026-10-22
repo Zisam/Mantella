@@ -323,6 +323,7 @@ class ChatManager:
                 # (LLMs tend to either return text or tool selection(s), but not both at the same time.
                 # So if only tools are returned, a second call is needed for a verbal response)
                 has_text_response = False
+                sentences_queued = 0
                 current_tools = tools  # Start with tools enabled
                 collected_tool_calls = []
                 tool_calls_added_this_turn = False  # Track if tool calls have been used in this iteration
@@ -442,6 +443,7 @@ class ChatManager:
                                                     first_sentence = False
                                                 new_sentence = self.generate_sentence(parsed_sentence)
                                                 blocking_queue.put(new_sentence)
+                                                sentences_queued += 1
                                                 parsed_sentence = None
                                     if settings.stop_generation:
                                         break
@@ -483,6 +485,19 @@ class ChatManager:
                                 # An empty stream (aborted connection, upstream flake) must not kill the conversation
                                 retries += 1
                                 logger.warning(f"LLM returned an empty response, retrying ({retries}/{max_retries})")
+                                if retries < max_retries:
+                                    first_token = True
+                                    continue
+
+                            if has_text_response and sentences_queued == 0 and settings.discarded_character_name and not collected_tool_calls and not settings.stop_generation and not self.__stop_generation.is_set():
+                                # The LLM addressed a character that is not in this conversation and the whole
+                                # turn was discarded: retry so the corrective feedback makes it pick an active NPC
+                                # instead of leaving the player with a silent turn
+                                retries += 1
+                                logger.warning(f"LLM only addressed unrecognized character '{settings.discarded_character_name}', retrying ({retries}/{max_retries})")
+                                # the corrective feedback for the next turn is already stored on the ChatManager;
+                                # clear the per-turn flag so a successful retry is not re-judged by the stale discard
+                                settings.discarded_character_name = None
                                 if retries < max_retries:
                                     first_token = True
                                     continue
