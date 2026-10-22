@@ -1,6 +1,5 @@
 from src.config.config_loader import ConfigLoader
 from src.tts.ttsable import TTSable
-import re
 import requests
 from typing import Any
 import io
@@ -61,8 +60,6 @@ class XTTS(TTSable):
 
 
     def _build_synthesis_payload(self, voiceline: str) -> dict:
-        # XTTS voices trailing ellipses as the Portuguese word "ponto" — collapse them to a single period
-        voiceline = re.sub(r'\.{2,}|…', '.', voiceline)
         return {
             'text': voiceline,
             'speaker_wav': self._sanitize_voice_name(self._last_voice.lower()),
