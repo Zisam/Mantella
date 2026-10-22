@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from src.config.config_loader import ConfigLoader
 import src.utils as utils
 import os
+import re
 from pathlib import Path
 from subprocess import DEVNULL
 import subprocess
@@ -22,6 +23,18 @@ if platform.system() == "Windows":
     from subprocess import STARTUPINFO, STARTF_USESHOWWINDOW
 
 logger = utils.get_logger()
+
+_INVALID_FILENAME_CHARS = r'\/:*?"<>|.'
+
+
+def sanitize_voiceline_cache_name(unique_name: str) -> str:
+    """Make a voiceline-derived string safe to use as a cache filename on Windows.
+
+    Replaces illegal filename characters AND control characters (LLMs sometimes emit
+    tabs/newlines inside dialogue) with spaces and collapses whitespace runs.
+    """
+    new_name = "".join((c if (c not in _INVALID_FILENAME_CHARS and ord(c) >= 32) else ' ') for c in unique_name)
+    return re.sub(r'\s+', ' ', new_name).strip()
 
 
 class TTSable(ABC):
@@ -121,8 +134,8 @@ class TTSable(ABC):
 
             #Use a sanitized version of the voice text as filename
             unique_name: str  = f'{voice} {voiceline.strip()}'[:150]
-            new_name: str = "".join(c for c in unique_name if c not in r'\/:*?"<>|.')
-            new_wav_file_name = f'{self._voiceline_folder}/save/{new_name.strip()}.wav'
+            new_name: str = sanitize_voiceline_cache_name(unique_name)
+            new_wav_file_name = f'{self._voiceline_folder}/save/{new_name}.wav'
 
             new_lip_file_name = new_wav_file_name.replace(".wav", ".lip")
             new_fuz_file_name = new_wav_file_name.replace(".wav", ".fuz")
