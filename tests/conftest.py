@@ -16,6 +16,20 @@ def pytest_configure(config):
     config.addinivalue_line("filterwarnings", r"ignore:[\s\S]*on_event is deprecated:DeprecationWarning")
     config.addinivalue_line("filterwarnings", r"ignore:The `name` is not the first parameter anymore:DeprecationWarning")
 
+
+@pytest.fixture(autouse=True)
+def _mute_system_sounds(monkeypatch):
+    """Mute Windows system sounds (error beeps etc) played by code under test.
+
+    Patched at the winsound level so tests that explicitly verify sound
+    behaviour (they install their own fakes on top) keep working.
+    """
+    try:
+        import winsound
+        monkeypatch.setattr(winsound, "PlaySound", lambda *args, **kwargs: None)
+    except ImportError:
+        pass
+
 from src.game_manager import GameStateManager
 from src.conversation.conversation import Conversation
 from src.output_manager import ChatManager
