@@ -139,7 +139,7 @@ class Conversation:
             self.__initiate_reload_conversation()
 
         # interrupt response if player has spoken
-        if self.__stt and self.__stt.has_player_spoken:
+        if self.__interruption_enabled() and self.__stt.has_player_spoken:
             return self.__interrupt_response()
         
         # restart mic listening as soon as NPC's first sentence is processed
@@ -170,7 +170,7 @@ class Conversation:
                 logger.debug(f'Waiting {round(self.last_sentence_audio_length, 1)} seconds for last voiceline to play')
             # before immediately sending the next voiceline, give the player the chance to interrupt
             while time.time() - self.last_sentence_start_time < self.last_sentence_audio_length:
-                if self.__stt and self.__stt.has_player_spoken:
+                if self.__interruption_enabled() and self.__stt and self.__stt.has_player_spoken:
                     return self.__interrupt_response()
                 time.sleep(0.01)
             self.last_sentence_audio_length = next_sentence.voice_line_duration + self.__context.config.wait_time_buffer
