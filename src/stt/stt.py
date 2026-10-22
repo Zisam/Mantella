@@ -406,11 +406,16 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
                     self.__processing_audio_error_count += 1
                     continue
 
+                finalize: tuple[bool, bool] | None = None
                 with self._lock:
                     if self.ptt_enabled:
-                        self._process_ptt_chunk(chunk)
+                        finalize = self._process_ptt_chunk(chunk)
                     else:
-                        chunk_count = self._process_vad_chunk(chunk, lookback_size, chunk_count)
+                        chunk_count, finalize = self._process_vad_chunk(chunk, lookback_size, chunk_count)
+                if finalize is not None:
+                    # run transcription OUTSIDE the lock: a slow/hanging Whisper or disk
+                    # write must never block consumers or audio chunk processing
+                    self._finalize_transcription(transcribe=finalize[0], save=finalize[1])
 
             except queue.Empty:
                 logger.debug('Queue is empty')
@@ -426,32 +431,46 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
     def _finalize_transcription(self, *, transcribe: bool = True, save: bool = True) -> None:
         """Transcribe buffered audio, signal readiness, and reset state.
 
-        Must be called while holding ``self._lock``.
+        The heavy work (Whisper, file I/O) runs WITHOUT holding ``self._lock`` so that a
+        slow or hanging backend can never block ``get_latest_transcription`` consumers or
+        the per-chunk audio processing; only the state swap is done under the lock.
 
         Args:
             transcribe: Whether to run transcription on the current buffer.
             save: Whether to save the audio buffer to disk (if ``save_mic_input`` also set).
         """
-        if transcribe and len(self._audio_buffer) > 0:
+        buffer = self._audio_buffer
+        # detach the buffer under the lock and reset the accumulation state up front,
+        # so processing works on a private snapshot
+        self._audio_buffer = np.array([], dtype=np.float32)
+        if transcribe and len(buffer) > 0:
             transcription_start_time = time.time()
-            self._current_transcription = self._transcribe(self._audio_buffer)
+            transcription = self._transcribe(buffer)
             logger.log(self.loglevel, f'STT took {round(time.time() - transcription_start_time, 5)} seconds to transcribe')
-        if save and self.__save_mic_input and len(self._audio_buffer) > 0:
-            self._save_audio(self._audio_buffer)
-        self._transcription_ready.set()
-        # capture whether a transcription is pending, since _reset_state clears the speech flags
-        has_transcription = bool(self._current_transcription and self._current_transcription.strip())
-        self._reset_state()
-        self._has_unconsumed_transcription = has_transcription
+        else:
+            transcription = self._current_transcription
+        if save and self.__save_mic_input and len(buffer) > 0:
+            self._save_audio(buffer)
+        with self._lock:
+            if transcribe and len(buffer) > 0:
+                self._current_transcription = transcription
+            self._transcription_ready.set()
+            # capture whether a transcription is pending, since _reset_state clears the speech flags
+            has_transcription = bool(self._current_transcription and self._current_transcription.strip())
+            self._reset_state()
+            self._has_unconsumed_transcription = has_transcription
 
 
-    def _process_ptt_chunk(self, chunk: np.ndarray) -> None:
+    def _process_ptt_chunk(self, chunk: np.ndarray) -> tuple[bool, bool] | None:
         """Process a single audio chunk in PTT mode.
 
         Must be called while holding ``self._lock``.
         When PTT is enabled, VAD-based detection is completely bypassed.
         Audio is accumulated only while the hotkey is held -
         on release the buffer is transcribed in one shot.
+
+        Returns a (transcribe, save) finalize request when transcription should run,
+        or None. The caller must run _finalize_transcription outside the lock.
         """
         is_pressed = self._ptt.is_pressed()
 
@@ -469,7 +488,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
             audio_duration = len(self._audio_buffer) / self.SAMPLING_RATE if len(self._audio_buffer) > 0 else 0
 
             if len(self._audio_buffer) > 0 and audio_duration >= self.MIN_PTT_DURATION:
-                self._finalize_transcription()
+                return (True, True)
             else:
                 logger.debug(f'PTT released with insufficient audio (duration: {audio_duration:.3f}s, min: {self.MIN_PTT_DURATION}s)')
                 self._reset_state()
@@ -480,10 +499,12 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
         # Timeout guard: prevent unbounded buffering from a stuck key
         if self._ptt_active and (len(self._audio_buffer) / self.SAMPLING_RATE) > self.listen_timeout:
             logger.warning(f'PTT timeout of {self.listen_timeout} seconds reached. Processing mic input...')
-            self._finalize_transcription()
+            return (True, True)
+
+        return None
 
 
-    def _process_vad_chunk(self, chunk: np.ndarray, lookback_size: int, chunk_count: int) -> int:
+    def _process_vad_chunk(self, chunk: np.ndarray, lookback_size: int, chunk_count: int) -> tuple[int, tuple[bool, bool] | None]:
         """Process a single audio chunk using VAD-based speech detection.
 
         Must be called while holding ``self._lock``.
@@ -494,7 +515,9 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
             chunk_count: Running counter of chunks since last proactive transcription update.
 
         Returns:
-            The (possibly reset) chunk_count for the caller to carry forward.
+            A (chunk_count, finalize_request) tuple. The caller must run
+            _finalize_transcription(transcribe=..., save=...) outside the lock when a
+            finalize request is present, otherwise None.
         """
         # Update audio buffer
         self._audio_buffer = np.concatenate((self._audio_buffer, chunk))
@@ -515,18 +538,16 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
         effective_pause = self._temporary_pause_override if self._temporary_pause_override is not None else self.pause_threshold
         if probability <= self.audio_threshold and self._speech_detected and time.time() - self._last_update_time > effective_pause:
             logger.log(self.loglevel, 'Speech ended')
-            self._finalize_transcription(transcribe=not self.proactive_mic_mode)
-            return chunk_count
+            return chunk_count, (not self.proactive_mic_mode, True)
 
         if not self._speech_detected:
-            return chunk_count
+            return chunk_count, None
         chunk_count += 1
 
         # Check for maximum speech duration
         if (len(self._audio_buffer) / self.SAMPLING_RATE) > self.listen_timeout:
             logger.warning(f'Listen timeout of {self.listen_timeout} seconds reached. Processing mic input...')
-            self._finalize_transcription(save=False)
-            return chunk_count
+            return chunk_count, (True, False)
 
         # Periodic proactive transcription update
         if self.proactive_mic_mode and chunk_count >= self.refresh_freq:
@@ -540,7 +561,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
 
             chunk_count = 0
 
-        return chunk_count
+        return chunk_count, None
 
 
     def _create_input_callback(self, q: queue.Queue):
@@ -565,7 +586,13 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
         except Exception:
             pass
         self._audio_buffer = np.array([], dtype=np.float32)
-        self.vad = SileroVAD(self.SAMPLING_RATE)
+        # Reuse the VAD instance and only clear its stream state: re-creating SileroVAD
+        # on every reset meant repeated native-library init/teardown (a hang risk) and
+        # ran while holding self._lock
+        try:
+            self.vad.reset()
+        except Exception:
+            self.vad = SileroVAD(self.SAMPLING_RATE)
         self._consecutive_empty_count = 0
 
 
